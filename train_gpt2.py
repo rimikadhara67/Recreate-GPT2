@@ -2,6 +2,49 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import math
+
+class CausalSelfAttention(nn.Module):
+  # pyTorhc optimized version of Multi_head Attention
+  def __init__(self, config):
+    super().__init__()
+    assert config.n_embd % config.n_head == 0
+
+    self.c_attn = nn.Linear(config.n_embd, 3*config.n_embd) # k, q, v projectstion for all heads, in a batch
+    self.c_proj = nn.Linear(config.n_embd, config.n_embd) # final output projections
+    self.n_head = config.n_head
+    self.n_embd = config.n_embd
+    
+    self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size))
+
+  def forward(self, x):
+    # at this point, we have tokens lined up in a sequence (1024 tokens) -- each token emits three vectors = k, q, v
+    B, T, C = x.size()
+    qkv = self.c_attn(x)     # -- queries and keys have to find relationships amongst each other -- done through the attention block
+    q, k, v = qkv.split(self.n_embd, dim=2) # -- splitting into the three  vectors
+    # making the num_heads into a batched_dimension -- to treat B and nh in batches to parallelize
+    k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+    q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+    v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+
+    att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt((k.size(-1))))
+    # -- masked attention = autoregressive, making tokens attend to what's before them instead of in the future
+    # -- ensures they don't learn to predict the future by already knowing the future. 
+    att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf')) 
+    att = F.softmax(att, dim=-1) #-- normalizes the attention
+    y = att @ v # attention matmul with values = weighted sum of the values of the tokens that we found interesting -- which tokens does this token attend to
+    y = y.transpose(1, 2).contiguous().view(B, T, C) # reassemble -- concat
+    y = self.c_proj(y)
+    return y
+
+class MLP(nn.Module):
+  def __init__(self, config):
+    super().__init__()
+    self.c_fc = nn.Linear(config.n_embd, 4*config.n_embd) # linear layer
+    self.gelu = nn.GELU(approximate='tanh') # basically rely without a flat tail at 0 -- slightly smoother relu
+    # another reason -- dead relu neuron problem -- 0 has no change or development of network
+    self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd) # linear layer
+
 
 class Block(nn.Module): # class initialized for hidden layers
   def __init_(self, config):
@@ -19,11 +62,11 @@ class Block(nn.Module): # class initialized for hidden layers
 
 @dataclass
 class GPTConfig:
-  block_size: int = 256
-  vocab_size: int = 65
-  n_layer: int = 6
-  n_head: int = 6
-  n_embd: int = 384
+  block_size: int = 1024 #max sequence lengths
+  vocab_size: int = 50257   # num_tokens
+  n_layer: int = 12
+  n_head: int = 12
+  n_embd: int = 768         # dim embeddings   
 
 
 class GPT(nn.Module):
