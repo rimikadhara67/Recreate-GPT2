@@ -47,7 +47,8 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module): # class initialized for hidden layers
-  def __init_(self, config):
+  def __init__(self, config):
+    super().__init__()
     self.ln_1 = nn.LayerNorm(config.n_embd) # -- layer normalization
     self.attn = CausalSelfAttention(config) # -- self attention layer
     self.ln_2 = nn.LayerNorm(config.n_embd) # -- layer norm 2
