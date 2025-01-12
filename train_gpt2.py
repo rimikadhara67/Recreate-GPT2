@@ -45,6 +45,11 @@ class MLP(nn.Module):
     # another reason -- dead relu neuron problem -- 0 has no change or development of network
     self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd) # linear layer
 
+  def forward(self, x):
+    x = self.c_fc(x)
+    x = self.gelu(x)
+    x = self.c_proj(x)
+    return x
 
 class Block(nn.Module): # class initialized for hidden layers
   def __init__(self, config):
@@ -85,59 +90,116 @@ class GPT(nn.Module):
     ))
     self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # final classifer -- Linear layer at the end before softmax
 
-    @classmethod
-    def from_pretrained(cls, model_type, override_args=None):
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        override_args = override_args or {} # default to empty dict
-        # only dropout can be overridden see more notes below
-        assert all(k == 'dropout' for k in override_args)
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
+def forward(self, idx): # token indices
+    B, T = idx.size() # idx should be of shape (B, T)
+    assert T <= self.config.block_size, f"Cannot forward sequence of length {T}"
+    pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # loop through 0 to T --> create pos indices, making sure they are on the same device
+    pos_emb = self.transformer.wpe(pos)
+    tok_emb = self.transformer.wte(idx)
+    x = tok_emb + pos_emb # broadcasting hidden in this
+    for block in self.transformer.h: # forward blocks of the transformer
+        x = block(x)
+    x = self.transformer.ln_f(x)
+    logits = self.lm_head(x)
+    return logits # calculate logits for the next BxT token = what is the BxT + 1 logit
 
-        # n_layer, n_head and n_embd are determined from model_type
-        config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
-        }[model_type]
-        print("forcing vocab_size=50257, block_size=1024, bias=True")
-        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
-        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
-        config_args['bias'] = True # always True for GPT model checkpoints
-        # we can override the dropout rate, if desired
-        if 'dropout' in override_args:
-            print(f"overriding dropout rate to {override_args['dropout']}")
-            config_args['dropout'] = override_args['dropout']
-        # create a from-scratch initialized minGPT model
-        config = GPTConfig(**config_args)
-        model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
+@classmethod    # returns the GPT object given the object type
+def from_pretrained(cls, model_type, override_args=None):
+    assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+    override_args = override_args or {} # default to empty dict
+    # only dropout can be overridden see more notes below
+    assert all(k == 'dropout' for k in override_args)
+    from transformers import GPT2LMHeadModel
+    print("loading weights from pretrained gpt: %s" % model_type)
 
-        # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
+    # n_layer, n_head and n_embd are determined from model_type
+    config_args = {
+        'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+        'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
+        'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
+        'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+    }[model_type]
+    print("forcing vocab_size=50257, block_size=1024, bias=True")
+    config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
+    config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
+    config_args['bias'] = True # always True for GPT model checkpoints
+    # we can override the dropout rate, if desired
+    if 'dropout' in override_args:
+        print(f"overriding dropout rate to {override_args['dropout']}")
+        config_args['dropout'] = override_args['dropout']
+    # create a from-scratch initialized minGPT model
+    config = GPTConfig(**config_args)
+    model = GPT(config)
+    sd = model.state_dict()
+    sd_keys = sd.keys()
+    sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
 
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
-        for k in sd_keys_hf:
-            if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
+    # init a huggingface/transformers model
+    model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+    sd_hf = model_hf.state_dict()
 
-        return model
+    # copy while ensuring all of the parameters are aligned and match in names and shapes
+    sd_keys_hf = sd_hf.keys()
+    sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
+    sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
+    transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+    # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+    # this means that we have to transpose these weights when we import them
+    assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+    for k in sd_keys_hf:
+        if any(k.endswith(w) for w in transposed):
+            # special treatment for the Conv1D weights we need to transpose
+            assert sd_hf[k].shape[::-1] == sd[k].shape
+            with torch.no_grad():
+                sd[k].copy_(sd_hf[k].t())
+        else:
+            # vanilla copy over the other parameters
+            assert sd_hf[k].shape == sd[k].shape
+            with torch.no_grad():
+                sd[k].copy_(sd_hf[k])
+
+    return model
+
+
+
+
+
+
+# -----------------------------------QUICK TEST -- GENERATE 5 SENTENCES----------------------------------- #
+import tiktoken
+
+num_return_seq = 5
+max_length = 30
+model = GPT.from_pretrained('gpt2')
+model.eval()
+model.to('cuda')
+
+
+enc = tiktoken.get_encoding("gpt2")
+tokens = enc.encode("Hello, I am a Language Model, ")
+tokens = torch.tensor(tokens, dtype=torch.long) # creating a torch tensor out of our tokens
+tokens = tokens.unsqueeze(0).repeat(num_return_seq, 1) # repeating it 5 times
+x = tokens.to('cuda')
+
+# generating next logits, x = (B, T) where B = 5, and T=8
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+while x.size(1) < max_length: #max_length = 30
+  with torch.no_grad():
+    # code block to keep generating next token until we reach 30
+    logits = model(x) # (B, T, vocab_size)
+    logits = logits[:, -1, :] # (B, vocab_size)
+
+    # get probabilities for the next token contenders
+    probs = F.softmax(logits, dim=-1) # (B, vocab_size)
+    topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # 50 by default --> only keep top 50 probability, others 0
+    ix = torch.multinomial(topk_probs, 1) # (B, 1) -- select the token
+    xcol = torch.gather(topk_indices, -1, ix)
+    x = torch.cat((x, xcol), dim=1) 
+
+# finally we get x = (5, 30)
+# printing out x
+for i in range(num_return_seq):
+  tokens = x[i, :max_length].tolist()
+  decoded = enc.decode(tokens)
+  print(f"> {decoded}")
